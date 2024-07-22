@@ -1,4 +1,5 @@
-# SCMStandz
+# MOSAiC Model Forcing Datasets
+
 This is the public repository of the **MOSAiC Model Forcing Datasets Working Group** (MMFD). The overall objective of the MMFD is to foster research based on MOSAiC observations[^1] and facilitate the comparison and reproducibility of results from different projects[^2]. This requires sharing the initialization, forcing, and validation merged datasets used to drive models.
 The purpose of this repository is to publish the code 'recipes' for generating these merged datasets. This public repository is the companion to a private repository in which the development of these recipes occurs.
 
