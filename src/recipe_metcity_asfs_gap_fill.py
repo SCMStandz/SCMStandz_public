@@ -10,97 +10,73 @@ import numpy as np
 import xarray as xr
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.stats import linregress
 from copy import deepcopy
 
 # Load mdf_toolkit
 # if this is first time running, go to the root of the mdf-toolkit directory 
-# and run ```python setup.py install``` first
+# and run ```pip install -e .``` first
 from mdftoolkit.MDF_toolkit import MDF_toolkit as MDF
+
+'''
+The archived met data are available in daily files, loading so many
+files in python can be prohibitively slow. So before running this
+script, we need to concatenate the daily files for each datasource.
+Within the directories containing their respective data, run the
+following nco (https://nco.sourceforge.net/) commands:
+metcity:
+ncrcat -v base_time,time_offset,temp_2m,rh_2m,atmos_pressure_2m,wspd_u_mean_2m,wspd_v_mean_2m,down_long_hemisp,down_short_hemisp,zenith_true,zenith_apparent,lat_tower,lon_tower -t 4 mosmet.metcity.level3.4.1min.20??????.000000.nc mosmet.metcity.level3.4.1min.mdfsubset.nc
+
+asfs50
+ncrcat -v base_time,time_offset,temp,rh,atmos_pressure,wspd_u_mean,wspd_v_mean,down_long_hemisp,down_short_hemisp,zenith_true,zenith_apparent,lat,lon -t 4 mosmet.asfs50.level3.4.1min.20??????.000000.nc mosmet.asfs50.level3.4.1min.mdfsubset.nc
+
+asfs40
+ncrcat -v base_time,time_offset,temp,rh,atmos_pressure,wspd_u_mean,wspd_v_mean,down_long_hemisp,down_short_hemisp,zenith_true,zenith_apparent,lat,lon -t 4 mosmet.asfs40.level3.4.1min.20??????.000000.nc mosmet.asfs40.level3.4.1min.mdfsubset.nc
+
+asfs30
+ncrcat -v base_time,time_offset,temp,rh,atmos_pressure,wspd_u_mean,wspd_v_mean,down_long_hemisp,down_short_hemisp,zenith_true,zenith_apparent,lat,lon -t 4 mosmet.asfs30.level3.4.1min.20??????.000000.nc mosmet.asfs30.level3.4.1min.mdfsubset.nc
+
+For shiprad data, we first need to average the secondly data to minutely
+This is easiest to do on ARM's jupyterhub. See the notebook
+'preprocess_shiprad.ipynb' or use the preprocessed data in the archive.
+'''
+
+## Parameters
+# Specify which dates belong to Drift Track 1 and Drift Track 2
+end_dt_drift_1 = pd.to_datetime("2020-07-31 12:00:00", utc=True)
+start_dt_drift_2 = pd.to_datetime("2020-08-27 12:00:00", utc=True)
+# Parameters that control bias correction and filling
+overlap_minutes = 180 # 3 hour overlap
+relaxation_minutes = 5 # so that almost all transition is in 15 min.
+
+# Specify which variables correspond to MDF var names
+var_map_dict = {'lat'   : 'lat_tower',
+                'lon'   : 'lon_tower',
+                'uas'   : 'wspd_u_mean_2m',
+                'vas'   : 'wspd_v_mean_2m',
+                'tas'   : 'temp_2m',
+                'hus'   : 'specific_humidity_2m',
+                'rlds'  : 'down_long_hemisp',
+                'rsds'  : 'down_short_hemisp',
+                }
+# Specify variable correspondence between Met City and ASFS
+varname_dict = {'lat_tower': 'lat',
+                'lon_tower': 'lon',
+                'temp_2m': 'temp', 
+                'rh_2m': 'rh', 
+                'atmos_pressure_2m': 'atmos_pressure',
+                'wspd_u_mean_2m': 'wspd_u_mean', 
+                'wspd_v_mean_2m': 'wspd_v_mean',
+                'down_long_hemisp': 'down_long_hemisp', 
+                'down_short_hemisp': 'down_short_hemisp',
+                'mixing_ratio_2m': None,
+                'zenith_true': 'zenith_true'}
+
 
 # Load paths
 with open(os.path.join('..', 'utils', 'paths.json')) as fp:
     paths_dict = json.load(fp)
 
-def select_variables(ds):
-    """
-    Select only surface variables of interest to reduce data volume
-    """
-
-    varnames = ['temp_2m', 'rh_2m', 'atmos_pressure_2m',
-                'wspd_u_mean_2m', 'wspd_v_mean_2m',
-                'down_long_hemisp', 'down_short_hemisp',
-                'zenith_true', 'zenith_apparent']
-    # add qc flags
-    for i in range(6):
-        varnames.append(varnames[i] + '_qc')
-    
-    return ds[varnames]
-
-def select_variables_asfs(ds):
-    """
-    Select only surface variables of interest to reduce data volume
-    """
-
-    varnames = ['temp', 'rh', 'atmos_pressure',
-                'wspd_u_mean', 'wspd_v_mean',
-                'down_long_hemisp', 'down_short_hemisp',
-                'zenith_true', 'zenith_apparent']
-    # add qc flags
-    for i in range(6):
-        varnames.append(varnames[i] + '_qc')
-    
-    return ds[varnames]
-
-def preprocess_shiprad(ds):
-    """
-    Selects variables we want from shiprad and averages to minutely freq
-    """
-
-    return ds['spn1b_total1'].resample(time='min').mean()
-
-# Load Met City, ASFS, and shiprad data
-ds_metcity = xr.open_mfdataset(
- paths=os.path.join(paths_dict['raw_data'], 'metcity', '*1min*.nc'),
- chunks='auto', preprocess= select_variables,
- concat_dim='time', engine='netcdf4', combine="nested")
-
-ds_asfs30 = xr.open_mfdataset(
- paths=os.path.join(paths_dict['raw_data'], 'asfs30', '*1min*.nc'),
- chunks='auto', preprocess= select_variables_asfs,
- concat_dim='time', engine='netcdf4', combine="nested")
-
-ds_asfs40 = xr.open_mfdataset(
- paths=os.path.join(paths_dict['raw_data'], 'asfs40', '*1min*.nc'),
- chunks='auto', preprocess= select_variables_asfs,
- concat_dim='time', engine='netcdf4', combine="nested")
-
-ds_asfs50 = xr.open_mfdataset(
- paths=os.path.join(paths_dict['raw_data'], 'asfs50', '*1min*.nc'),
- chunks='auto', preprocess= select_variables_asfs,
- concat_dim='time', engine='netcdf4', combine="nested")
-
-# Met City is the primary dataset, but it contains a few gaps, fill these gaps
-# with Na values
-dti = pd.date_range(start=ds_metcity.indexes['time'][0],
-                    end=ds_metcity.indexes['time'][-1], freq='min')
-ds_metcity = ds_metcity.reindex(indexers={'time': dti})
-
-# Preliminary work filling missing radiation with ship data.
-# Need to revisit once ARM uploads longwave data
-# For now just use unshaded shortwave at the center detector ('spn1b_total')
-da_shipradS1 = xr.open_mfdataset(
-    paths=os.path.join(paths_dict['raw_data'], 'shiprad', 'mosshipradS1*.nc'),
-    chunks='auto', preprocess=preprocess_shiprad, concat_dim='time',
-    engine='netcdf4', combine='nested')
-# read into memory for convenience
-da_shipradS1 = da_shipradS1.load()
-# The first and last indices are duplicated, just drop for now
-da_shipradS1 = da_shipradS1.drop_duplicates('time')
-
-# Load gap filling guide
-df_gap_fill = pd.read_excel("gap_fill_met_city.xlsx", parse_dates=[1, 2])
-
+## Functions
 def find_gap_edge(da, start, end, first=True):
     """
     Convenience function for finding the timestamp of a gap start/end
@@ -247,7 +223,9 @@ def gap_fill(param, fill_source, gap_start, gap_end, offset_seconds,
     ds_gap_fill = xr.merge([da_gap_fill, da_gap_src])
 
     # Update dataset with filled values
-    ds_fill = ds_gap_fill.combine_first(ds_fill)
+    ds_fill_var = ds_gap_fill.combine_first(ds_fill[[param, 
+                                                     param+'_src']])
+    ds_fill.update(ds_fill_var)
 
     # Plot if desired
     if plot:
@@ -275,155 +253,105 @@ def gap_fill(param, fill_source, gap_start, gap_end, offset_seconds,
             f.savefig(os.path.join(plotpath, fname))
             plt.close(f)
     return ds_fill
+
+def asfs_gap_fill(asfs_name, df_gap_fill, varname_dict, ds_fill,
+                  overlap_minutes, relaxation_minutes, plot=False,
+                  plotpath='.'):
+    """
+    Fill Met City gaps with specific ASFS
+
+    Parameters:
+    -----------
+    asfs_name: str
+        Name of ASFS dataset to use for gap filling
+    df_gap_fill: pandas DataFrame
+        DataFrame with which variable, station and gap to fill
+    varname_dict: dict
+        Mapping from Met City variable names to ASFS names
+    ds_fill: xarray Dataset
+        Dataset to fill gaps in.
+    overlap_minutes: numeric
+        How many minutes before and after gap to use for bias correction
+    relaxation_minutes: numeric
+        Exponential decay constant for relaxing fill values to Met City 
+        data.
+    plot: bool, optional
+        Whether or not to generate a plot for these asfs data.
+    plotpath: str, optional
+        Where to save figures to, optional.
+
+    Returns:
+    --------
+    xarray DataSet with these gaps filled
+
+    """
+
+    ds_asfs = xr.open_dataset(os.path.join(paths_dict['raw_data'], 
+        asfs_name, 'mosmet.'+asfs_name+'.level3.4.1min.mdfsubset.nc'),
+        engine='netcdf4')
+
+    # Fill gaps
+    source_dict = {'metcity': ds_metcity,
+                    asfs_name: ds_asfs
+                    }
+    # Fill identified gaps with ASFS data
+    for index, row in df_gap_fill.iterrows():
+        if row['station']==asfs_name:
+            ds_fill = gap_fill(row['param'], row['station'], 
+                               row['gap_start'], row['gap_end'], 
+                               row['offset'], ds_fill, source_dict, 
+                               overlap_minutes, relaxation_minutes, 
+                               varname_dict, primary_source='metcity', 
+                               plot=plot, plotpath=plotpath)
+    ds_asfs.close()
+    return ds_fill
+
+def find_gaps(ds, param):
+    """
+    Convenience function for finding gaps in a dataset
+
+    Parameters:
+    -----------
+    ds: xarray Dataset
+        The dataset to find the gaps in.
+    param: string
+        Name of the variable to find gaps in.
     
-# Create dicts needed for gap filling
-varname_dict = {'temp_2m': 'temp', 
-                'rh_2m': 'rh', 
-                'atmos_pressure_2m': 'atmos_pressure',
-                'wspd_u_mean_2m': 'wspd_u_mean', 
-                'wspd_v_mean_2m': 'wspd_v_mean',
-                'down_long_hemisp': 'down_long_hemisp', 
-                'down_short_hemisp': 'down_short_hemisp',
-                'mixing_ratio_2m': None}
-source_dict = {'metcity': ds_metcity,
-               'asfs30': ds_asfs30,
-               'asfs40': ds_asfs40,
-               'asfs50': ds_asfs50,
-               }
+    Returns:
+    --------
+    numpy array Nx2 where each row is a gap
+    """
 
-# Find gap edges and update df_gap_fill_mod if needed
-df_gap_fill_mod = df_gap_fill.copy(deep=True)
-buffer = pd.Timedelta(minutes=10)
-for i in df_gap_fill_mod.index:
-    found_edge = False
-    tbl_start = df_gap_fill_mod.at[i,'gap_start']
-    while found_edge is False:
-        search_start = tbl_start - buffer
-        search_end = tbl_start + buffer
-        edge_start = find_gap_edge(ds_metcity[df_gap_fill_mod.at[i,'param']], 
-                                start=search_start, end=search_end,
-                                first=True)
-        # If we haven't found the edge...
-        if search_start==edge_start:
-            tbl_start = tbl_start - buffer
+    da = ds[param]
+    gaps = []
+    in_gap = False
+    gap = np.zeros(2, dtype='datetime64[ns]')
+    last_time = 0
+    for row in da:
+        if np.isnan(row.item()):
+            if not in_gap:
+                gap[0] = row.time.item()
+                in_gap = True
         else:
-            found_edge=True
-            df_gap_fill_mod.at[i,'gap_start'] = edge_start
-    found_edge = False
-    tbl_end = df_gap_fill_mod.at[i,'gap_end']
-    while found_edge is False:
-        search_start = tbl_end - buffer
-        search_end = tbl_end + buffer
-        edge_end = find_gap_edge(ds_metcity[df_gap_fill_mod.at[i,'param']], 
-                                start=search_start, end=search_end,
-                                first=False)
-        # If we haven't found the edge...
-        if search_end==edge_end:
-            tbl_end = tbl_end + buffer
-        else:
-            found_edge=True
-            df_gap_fill_mod.at[i,'gap_end'] = edge_end
-# This results in a few small changes to the end timestamps of gaps
-print(df_gap_fill.compare(df_gap_fill_mod))
+            if in_gap:
+                gap[1] = last_time
+                in_gap = False
+                gaps.append(deepcopy(gap))
+        last_time = row.time.item()
+    gaps_np = np.array(gaps)
 
-# Create dataset with filled values
-ds_fill = ds_metcity.copy(deep=True)
-# Add variables for the source of filled parameters
-arr_src = np.full(ds_fill.dims['time'], 'metcity', dtype='object')
-for key in varname_dict.keys():
-    ds_fill[key + '_src'] =('time',arr_src)
+    # Need to eliminate times that the ship was not present
+    end_co1 = np.datetime64("2020-05-16")
+    start_co2 = np.datetime64("2020-06-19")
+    end_co2 = np.datetime64("2020-07-31")
+    start_co3 = np.datetime64("2020-08-21")
+    gaps_co1 = gaps_np[gaps_np[:,1]<=end_co1,:]
+    gaps_co2 = gaps_np[np.logical_and(gaps_np[:,0]>start_co2, gaps_np[:,1]<=end_co2),:]
+    gaps_co3 = gaps_np[gaps_np[:,0]>start_co3,:]
+    gaps_co = np.concatenate([gaps_co1, gaps_co2, gaps_co3])
 
-# Parameters that control bias correction and filling
-overlap_minutes = 180 # 3 hour overlap 60*24*14 # 2 week overlap
-relaxation_minutes = 5 # so that almost all transition is in 15 min.
+    return gaps_co
 
-# Fill identified gaps with ASFS data
-for index, row in df_gap_fill_mod.iterrows():
-    ds_fill = gap_fill(row['param'], row['station'], row['gap_start'], 
-             row['gap_end'], row['offset'], 
-             ds_fill, source_dict, overlap_minutes, relaxation_minutes,
-             varname_dict, primary_source='metcity', plot=True,
-             plotpath='/home/dcsewall/figures/gap_fill_met_city')
-
-# Finish filling shortwave radiation gaps
-# First, anytime the solar zenith angle is below a critical threshold set
-# downwelling shortwave to zero, for simplicity let's use the civil twilight
-# (sza > 96 degrees) applied to the solar zenith angle
-# First we have to produce a continuous record of solar zenith angle
-# Let's take the mean of all available met city and asfs data
-da_sza = xr.concat([ds_metcity['zenith_true'], ds_asfs30['zenith_true'], 
-                    ds_asfs40['zenith_true'], ds_asfs50['zenith_true']]
-                    , dim='src')
-da_sza = da_sza.mean(dim='src', skipna=True)
-# And interpolate to fill missing values, use linear interpolation
-da_sza = da_sza.chunk(dict(time=-1)).interpolate_na(dim='time', 
-                                                    method='linear')
-# The results are not perfect, but they look sufficient for this purpose
-crit_sza = 96
-da_sza.name = 'interp_sza'
-ds_fill = xr.merge([ds_fill, da_sza])
-ds_fill['down_short_hemisp'][(ds_fill['interp_sza'] >= crit_sza).compute()] = 0.0
- 
-# Fill gaps in radiation with shiprad
-# just shortwave for now
-
-# First we need to find all gaps in shortwave
-# Simplest if we just move the entire array into memory
-da_sw = ds_fill['down_short_hemisp'].compute()
-gaps = []
-in_gap = False
-gap = np.zeros(2, dtype='datetime64[ns]')
-last_time = 0
-for row in da_sw:
-    if np.isnan(row.item()):
-        if not in_gap:
-            gap[0] = row.time.item()
-            in_gap = True
-    else:
-        if in_gap:
-            gap[1] = last_time
-            in_gap = False
-            gaps.append(deepcopy(gap))
-    last_time = row.time.item()
-gaps_np = np.array(gaps)
-
-# Need to eliminate times that the ship was not present
-end_co1 = np.datetime64("2020-05-16")
-start_co2 = np.datetime64("2020-06-19")
-end_co2 = np.datetime64("2020-07-31")
-start_co3 = np.datetime64("2020-08-21")
-gaps_co1 = gaps_np[gaps_np[:,1]<=end_co1,:]
-gaps_co2 = gaps_np[np.logical_and(gaps_np[:,0]>start_co2, gaps_np[:,1]<=end_co2),:]
-gaps_co3 = gaps_np[gaps_np[:,0]>start_co3,:]
-gaps_co = np.concatenate([gaps_co1, gaps_co2, gaps_co3])
-
-df_gap_sw = pd.DataFrame({'param': 'down_short_hemisp',
-                          'gap_start': gaps_co[:,0],
-                          'gap_end': gaps_co[:,1],
-                          'station': 'shipradS1',
-                          'offset': 0})
-
-# Create dataset for shiprad same as asfs
-da_shipradS1.name = 'down_short_hemisp'
-arr_src = np.full(da_shipradS1.sizes['time'], 'shipradS1', dtype='object')
-da_src = xr.DataArray(arr_src, coords={'time':da_shipradS1.time}, 
-                      name='down_short_hemisp_src')
-ds_shipradS1 = xr.merge([da_shipradS1, da_src])
-
-# Fill gaps
-# Parameters that control bias correction and filling
-overlap_minutes = 180 # 3 hour overlap 60*24*14 # 2 week overlap
-relaxation_minutes = 5 # so that almost all transition is in 15 min.
-source_dict = {'metcity': ds_metcity,
-               'shipradS1': ds_shipradS1}
-for index, row in df_gap_sw.iterrows():
-    ds_fill = gap_fill(row['param'], row['station'], row['gap_start'], 
-             row['gap_end'], row['offset'], 
-             ds_fill, source_dict, overlap_minutes, relaxation_minutes,
-             varname_dict, primary_source='metcity', plot=True,
-             plotpath='/home/dcsewall/figures/gap_fill_met_city')
-
-# function for mixing ratio
 def calc_mix_ratio(temp, RHw, press):
     """
     Function for calculating mixing ratio from C. Cox
@@ -460,7 +388,125 @@ def calc_mix_ratio(temp, RHw, press):
 
     return x
 
-# Create dataframe for export
+## Load Met City data, create dataset filled for filled data
+# Load Met City data
+ds_metcity = xr.open_dataset(os.path.join(paths_dict['raw_data'], 
+    'metcity', 'mosmet.metcity.level3.4.1min.mdfsubset.nc'),
+    engine='netcdf4')
+# Create fixed frequency time index: adds na's where no file is present
+dti = pd.date_range(start=ds_metcity.indexes['time'][0],
+                    end=ds_metcity.indexes['time'][-1], freq='min')
+ds_metcity = ds_metcity.reindex(indexers={'time': dti})
+# Create dataset for filled values
+ds_fill = ds_metcity.copy(deep=True)
+# Add variables for the source of filled parameters
+arr_src = np.full(ds_fill.dims['time'], 'metcity', dtype='object')
+for key in varname_dict.keys():
+    ds_fill[key + '_src'] =('time',arr_src)
+
+## Create dataframe to guide which gaps get filled
+# Load gap filling guide
+df_gap_fill = pd.read_excel("gap_fill_met_city.xlsx", parse_dates=[1, 2])
+
+# Find gap edges and update df_gap_fill_mod if needed
+df_gap_fill_mod = df_gap_fill.copy(deep=True)
+buffer = pd.Timedelta(minutes=10)
+for i in df_gap_fill_mod.index:
+    found_edge = False
+    tbl_start = df_gap_fill_mod.at[i,'gap_start']
+    while found_edge is False:
+        search_start = tbl_start - buffer
+        search_end = tbl_start + buffer
+        edge_start = find_gap_edge(ds_metcity[df_gap_fill_mod.at[i,'param']], 
+                                start=search_start, end=search_end,
+                                first=True)
+        # If we haven't found the edge...
+        if search_start==edge_start:
+            tbl_start = tbl_start - buffer
+        else:
+            found_edge=True
+            df_gap_fill_mod.at[i,'gap_start'] = edge_start
+    found_edge = False
+    tbl_end = df_gap_fill_mod.at[i,'gap_end']
+    while found_edge is False:
+        search_start = tbl_end - buffer
+        search_end = tbl_end + buffer
+        edge_end = find_gap_edge(ds_metcity[df_gap_fill_mod.at[i,'param']], 
+                                start=search_start, end=search_end,
+                                first=False)
+        # If we haven't found the edge...
+        if search_end==edge_end:
+            tbl_end = tbl_end + buffer
+        else:
+            found_edge=True
+            df_gap_fill_mod.at[i,'gap_end'] = edge_end
+
+## Fill gaps with ASFS data
+ds_fill = asfs_gap_fill('asfs30', df_gap_fill_mod, varname_dict, 
+                        ds_fill, overlap_minutes, relaxation_minutes)
+ds_fill = asfs_gap_fill('asfs40', df_gap_fill_mod, varname_dict, 
+                        ds_fill, overlap_minutes, relaxation_minutes)
+ds_fill = asfs_gap_fill('asfs50', df_gap_fill_mod, varname_dict, 
+                        ds_fill, overlap_minutes, relaxation_minutes)
+
+
+## Finish filling shortwave radiation gaps
+# First, anytime the solar zenith angle is below a critical threshold set
+# downwelling shortwave to zero, for simplicity let's use the civil twilight
+# (sza > 96 degrees) applied to the solar zenith angle
+# First we have to produce a continuous record of solar zenith angle
+da_sza = ds_fill['zenith_true']
+# And interpolate to fill missing values, use linear interpolation
+da_sza = da_sza.interpolate_na(dim='time', method='linear')
+# The results are not perfect, but they look sufficient for this purpose
+crit_sza = 96
+da_sza.name = 'interp_sza'
+ds_fill = xr.merge([ds_fill, da_sza])
+ds_fill['down_short_hemisp'][(ds_fill['interp_sza'] >= crit_sza)] = 0.0
+
+# Fill gaps in radiation with shiprad
+# just shortwave for now
+# Preliminary work filling missing radiation with ship data.
+# Need to revisit once ARM uploads longwave data
+# For now just use unshaded shortwave at the center detector ('spn1b_total')
+ds_shipradS1 = xr.open_dataset(os.path.join(paths_dict['raw_data'], 
+    'shiprad', 'mosshipradS1.b1.subset.20191015_20200918.nc'), 
+    engine='netcdf4')
+
+# Specify variable correspondence between Met City and shiprad
+varname_dict_shiprad = {'lat_tower': 'lat',
+                        'lon_tower': 'lon',
+                        'temp_2m': 'temp', 
+                        'down_long_hemisp': 'downwelling_longwave', 
+                        'down_short_hemisp': 'spn1_total_corr'}
+
+# Find gaps in shortwave
+gaps_sw = find_gaps(ds_fill, 'down_short_hemisp')
+# Find gaps in longwave
+gaps_lw = find_gaps(ds_fill, 'down_long_hemisp')
+
+df_gap_sw = pd.DataFrame({'param': 'down_short_hemisp',
+                          'gap_start': gaps_sw[:,0],
+                          'gap_end': gaps_sw[:,1],
+                          'station': 'shipradS1',
+                          'offset': 0})
+df_gap_lw = pd.DataFrame({'param': 'down_long_hemisp',
+                          'gap_start': gaps_sw[:,0],
+                          'gap_end': gaps_sw[:,1],
+                          'station': 'shipradS1',
+                          'offset': 0})
+df_gap_shiprad = pd.concat([df_gap_sw, df_gap_lw])
+
+# Fill gaps
+source_dict = {'metcity': ds_metcity,
+               'shipradS1': ds_shipradS1}
+for index, row in df_gap_shiprad.iterrows():
+    ds_fill = gap_fill(row['param'], row['station'], row['gap_start'], 
+             row['gap_end'], row['offset'], 
+             ds_fill, source_dict, overlap_minutes, relaxation_minutes,
+             varname_dict_shiprad, primary_source='metcity', plot=False)
+
+## Create dataframe for export and compute specific humidity
 df_out = ds_fill.to_dataframe()
 # Convert air T to Kelvin
 df_out['temp_2m'] = df_out['temp_2m'] + 273.15
@@ -484,9 +530,10 @@ set_src_nan(df_out, 'wspd_v_mean_2m')
 set_src_nan(df_out, 'down_long_hemisp')
 set_src_nan(df_out, 'down_short_hemisp')
 
-# Convert into MDF, for now ignore tagging source of the values
-# instantiate class that will analyze and output data in MDF format
-MDF_out = MDF(supersite_name='MOSAiC', verbose=True)
+## Convert into MDF
+# First drift track (legs 1-4)
+df_out_drift_1 = df_out.loc[:end_dt_drift_1]
+MDF_out = MDF(supersite_name='MOSAiC_atm_drift1', verbose=True)
 global_atts = {
     "title"                    : "MOSAiC surface meteorology",
     "Conventions"              : "MDF, CF (where possible)",
@@ -495,20 +542,20 @@ global_atts = {
     "contributor_email"        : "christopher.j.cox@noaa.gov",
     "institution"              : "NOAA",
     "creator_name"             : "David Clemens-Sewall",
-    "creator_email"            : "dcsewall@ucar.edu",
-    "project"                  : "MOSAiC Single Column Modeling Working Group",
+    "creator_email"            : "david.clemens-sewall@noaa.gov",
+    "project"                  : "MOSAiC Model Forcing Dataset working group",
     "summary"                  : "BETA gap filled with in-situ measurements",
-    "id"                       : "DOI: XXXXXXXX",
+    "id"                       : "doi:10.18739/A2RN30916",
     "license"                  : "CC-0", 
-    "metadata_link"            : "http://www.doi-metatadat-link.org/mydoiiiii",
+    "metadata_link"            : "https://doi.org/10.5281/zenodo.10819496",
     "references"               : ("Continuous observations of the surface " +
                                   "energy budget and meteorology over the " +
                                   "Arctic sea ice during MOSAiC/" +
                                   "https://doi.org/10.1038/s41597-023-02415-5" +
                                   ";  Shipboard Portable Radiation Package/" +
                                   "https://doi.org/10.5439/1437994"),
-    "time_coverage_start"      : "{}".format(df_out.index[0]),
-    "time_coverage_end"        : "{}".format(df_out.index[-1]),
+    "time_coverage_start"      : "{}".format(df_out_drift_1.index[0]),
+    "time_coverage_end"        : "{}".format(df_out_drift_1.index[-1]),
     "naming_authority"         : "___", 
     "standard_name_vocabulary" : "___", 
     "keywords"                 : "surface energy budget, arctic, polar",
@@ -516,30 +563,75 @@ global_atts = {
 }
 MDF_out.update_global_atts(global_atts)  
 
-# Specify which variables correspond
-var_map_dict = {'uas'   : 'wspd_u_mean_2m',
-                'vas'   : 'wspd_v_mean_2m',
-                'tas'   : 'temp_2m',
-                'hus'   : 'specific_humidity_2m',
-                'rlds'  : 'down_long_hemisp',
-                'rsds'  : 'down_short_hemisp',
-                }
-modf_df = MDF.map_vars_to_mdf(df_out, var_map_dict, drop=True)
+modf_df = MDF.map_vars_to_mdf(df_out_drift_1, var_map_dict, drop=True)
 MDF_out.add_data_timeseries(modf_df, cadence="time01")
-MDF_out.write_files(output_dir=paths_dict['proc_data'])
+MDF_out.write_files(output_dir=paths_dict['proc_data'],
+                    fname_only_underscores=True)
+
+# Second drift track (leg 5)
+df_out_drift_2 = df_out.loc[start_dt_drift_2:]
+MDF_out = MDF(supersite_name='MOSAiC_atm_drift2', verbose=True)
+global_atts = {
+    "title"                    : "MOSAiC surface meteorology",
+    "Conventions"              : "MDF, CF (where possible)",
+    "standard_name_vocabulary" : "",
+    "contributor_name"         : "Christopher J. Cox",
+    "contributor_email"        : "christopher.j.cox@noaa.gov",
+    "institution"              : "NOAA",
+    "creator_name"             : "David Clemens-Sewall",
+    "creator_email"            : "david.clemens-sewall@noaa.gov",
+    "project"                  : "MOSAiC Model Forcing Dataset working group",
+    "summary"                  : "BETA gap filled with in-situ measurements",
+    "id"                       : "doi:10.18739/A2RN30916",
+    "license"                  : "CC-0", 
+    "metadata_link"            : "https://doi.org/10.5281/zenodo.10819496",
+    "references"               : ("Continuous observations of the surface " +
+                                  "energy budget and meteorology over the " +
+                                  "Arctic sea ice during MOSAiC/" +
+                                  "https://doi.org/10.1038/s41597-023-02415-5" +
+                                  ";  Shipboard Portable Radiation Package/" +
+                                  "https://doi.org/10.5439/1437994"),
+    "time_coverage_start"      : "{}".format(df_out_drift_2.index[0]),
+    "time_coverage_end"        : "{}".format(df_out_drift_2.index[-1]),
+    "naming_authority"         : "___", 
+    "standard_name_vocabulary" : "___", 
+    "keywords"                 : "surface energy budget, arctic, polar",
+    "calendar"                 : "standard",
+}
+MDF_out.update_global_atts(global_atts)  
+
+modf_df = MDF.map_vars_to_mdf(df_out_drift_2, var_map_dict, drop=True)
+MDF_out.add_data_timeseries(modf_df, cadence="time01")
+MDF_out.write_files(output_dir=paths_dict['proc_data'],
+                    fname_only_underscores=True)
 
 
-### After here is not needed for creating MDF
+## After here is not needed for creating MDF
 # For summaries print amount of data and sources
+print('Drift 1:')
 print('Air Temperature')
-print(df_out['temp_2m_src'].value_counts(dropna=False)/df_out.shape[0])
+print(df_out_drift_1['temp_2m_src'].value_counts(dropna=False)/df_out_drift_1.shape[0])
 print('Atmospheric Pressure')
-print(df_out['atmos_pressure_2m_src'].value_counts(dropna=False)/df_out.shape[0])
+print(df_out_drift_1['atmos_pressure_2m_src'].value_counts(dropna=False)/df_out_drift_1.shape[0])
 print('Relative Humidity')
-print(df_out['rh_2m_src'].value_counts(dropna=False)/df_out.shape[0])
+print(df_out_drift_1['rh_2m_src'].value_counts(dropna=False)/df_out_drift_1.shape[0])
 print('Wind Velocity')
-print(df_out['wspd_u_mean_2m_src'].value_counts(dropna=False)/df_out.shape[0])
+print(df_out_drift_1['wspd_u_mean_2m_src'].value_counts(dropna=False)/df_out_drift_1.shape[0])
 print('Downwelling Longwave')
-print(df_out['down_long_hemisp_src'].value_counts(dropna=False)/df_out.shape[0])
+print(df_out_drift_1['down_long_hemisp_src'].value_counts(dropna=False)/df_out_drift_1.shape[0])
 print('Downwelling Shortwave')
-print(df_out['down_short_hemisp_src'].value_counts(dropna=False)/df_out.shape[0])
+print(df_out_drift_1['down_short_hemisp_src'].value_counts(dropna=False)/df_out_drift_1.shape[0])
+
+print('Drift 2:')
+print('Air Temperature')
+print(df_out_drift_2['temp_2m_src'].value_counts(dropna=False)/df_out_drift_2.shape[0])
+print('Atmospheric Pressure')
+print(df_out_drift_2['atmos_pressure_2m_src'].value_counts(dropna=False)/df_out_drift_2.shape[0])
+print('Relative Humidity')
+print(df_out_drift_2['rh_2m_src'].value_counts(dropna=False)/df_out_drift_2.shape[0])
+print('Wind Velocity')
+print(df_out_drift_2['wspd_u_mean_2m_src'].value_counts(dropna=False)/df_out_drift_2.shape[0])
+print('Downwelling Longwave')
+print(df_out_drift_2['down_long_hemisp_src'].value_counts(dropna=False)/df_out_drift_2.shape[0])
+print('Downwelling Shortwave')
+print(df_out_drift_2['down_short_hemisp_src'].value_counts(dropna=False)/df_out_drift_2.shape[0])

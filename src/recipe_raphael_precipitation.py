@@ -1,5 +1,8 @@
 """
 Recipe for adding pseudo-precipitation from Ian Raphael
+
+pseudo-precipitation is only used for the winter period
+Summer rainfall is from Smith et al. (2024) https://doi.org/10.5194/egusphere-2024-1977
 """
 
 import os
@@ -21,7 +24,7 @@ with open(os.path.join('..', 'utils', 'paths.json')) as fp:
     paths_dict = json.load(fp)
 
 # Load existing MDF file that doesn't have snowfall
-fn = "MOSAiC_MDF_20191005-20201001.nc"
+fn = "MOSAiC_atm_drift1_MDF_20191015_20200731.nc"
 filename = os.path.join(paths_dict['proc_data'], fn)
 MDF_out = MDF.load_mdf(filename)
 
@@ -79,17 +82,51 @@ df_sheba_prsn = df_snow_sheba[['time01', 'prsn']].set_index('time01')
 # For SHEBA set the precipitation rate of the last day to 0
 df_sheba_prsn.loc["2020-05-10":"2020-05-12", 'prsn'] = 0
 
+# Load summertime liquid precipitation from Smith et al. (2024)
+df_summer = pd.read_csv(os.path.join(paths_dict['raw_data'], 
+                                    'MOSAiCSummerLiquidPrecip.txt'),
+                       delim_whitespace=True, header=6)
+# convert time index to datetime
+df_summer.index = (pd.to_datetime('2019-12-31') +
+                   pd.to_timedelta(df_summer.Yearday.values, 'd')).round('min')
+df_summer.index.rename('time', inplace=True)
+# Average radar and PWD rain rate estimates and convert to kg m-2 s-1
+df_summer['prlq'] = (df_summer.RR_rad + df_summer.RR_pwd)/(2.0 * 3600)
+
+# Combine winter and summer precipitation
+df_fyi_prsn = pd.merge(df_fyi_prsn, df_summer.prlq, left_index=True,
+                   right_index=True, how='outer').fillna(0.0)
+df_fyi_prsn['pr'] = df_fyi_prsn['prsn'] + df_fyi_prsn['prlq']
+df_syi_prsn = pd.merge(df_syi_prsn, df_summer.prlq, left_index=True,
+                   right_index=True, how='outer').fillna(0.0)
+df_syi_prsn['pr'] = df_syi_prsn['prsn'] + df_syi_prsn['prlq']
+
+# For SHEBA set total precipitation equal to snowfall
+df_sheba_prsn['pr'] = df_sheba_prsn['prsn']
+
 # Add to MDF
+# Explicitly set missing precip values to zero
+df_fyi_prsn = df_fyi_prsn.reindex(MDF_out._subsites[None].var_data['time01']
+                          [0].index, fill_value=0.0)
 MDF_out.add_data_timeseries(df_fyi_prsn, cadence="time01")
 # Update global attributes
 curr_references = MDF_out._global_atts['references']
+curr_contrib_name = MDF_out._global_atts['contributor_name']
+curr_contrib_email = MDF_out._global_atts['contributor_email']
 MDF_out.update_global_atts({'references': curr_references +
                            '; Measurements of sea ice point-mass-balance ' +
                            'using hotwire thickness gauges and ablation ' +
                            'stakes during the Multidisciplinary drifting ' +
                            'Observatory for the Study of Arctic Climate ' + 
                            '(MOSAiC) Expedition in the Central Arctic ' +
-                           '(2019-2020)/https://doi.org/10.18739/A2NK36626'})
+                           '(2019-2020)/https://doi.org/10.18739/A2NK36626' +
+                           'Formation and fate of freshwater on an ice ' +
+                           'floe in the Central Arctic/'+
+                           'https://doi.org/10.5194/egusphere-2024-1977',
+                           'contributor_name': curr_contrib_name +
+                           '; Matthew Shupe; Ian Raphael',
+                           'contributor_email': curr_contrib_email +
+                           '; matthew.shupe@noaa.gov; Ian.A.Raphael.th@dartmouth.edu'})
 curr_summary = MDF_out._global_atts['summary']
 MDF_out.update_global_atts({'summary': curr_summary +
                             ', prsn is pseudo-precipitation derived from ' +
@@ -97,32 +134,46 @@ MDF_out.update_global_atts({'summary': curr_summary +
                             ' density of 330 kg/m3'})
 
 # Rename MDF and write files
-MDF_out._name = "MOSAiC_Raphael_snow_fyi"
-MDF_out.write_files(output_dir=paths_dict['proc_data'])
+MDF_out._name = "MOSAiC_atm_drift1_stakes_snow_fyi"
+MDF_out.write_files(output_dir=paths_dict['proc_data'],
+                    fname_only_underscores=True)
 
 # Repeat for SYI
 del MDF_out
-fn = "MOSAiC_MDF_20191005-20201001.nc"
+fn = "MOSAiC_atm_drift1_MDF_20191015_20200731.nc"
 filename = os.path.join(paths_dict['proc_data'], fn)
 MDF_out = MDF.load_mdf(filename)
+# Explicitly set missing precip values to zero
+df_syi_prsn = df_syi_prsn.reindex(MDF_out._subsites[None].var_data['time01']
+                          [0].index, fill_value=0.0)
 MDF_out.add_data_timeseries(df_syi_prsn, cadence="time01")
 # Update global attributes
 curr_references = MDF_out._global_atts['references']
+curr_contrib_name = MDF_out._global_atts['contributor_name']
+curr_contrib_email = MDF_out._global_atts['contributor_email']
 MDF_out.update_global_atts({'references': curr_references +
                            '; Measurements of sea ice point-mass-balance ' +
                            'using hotwire thickness gauges and ablation ' +
                            'stakes during the Multidisciplinary drifting ' +
                            'Observatory for the Study of Arctic Climate ' + 
                            '(MOSAiC) Expedition in the Central Arctic ' +
-                           '(2019-2020)/https://doi.org/10.18739/A2NK36626'})
+                           '(2019-2020)/https://doi.org/10.18739/A2NK36626' +
+                           'Formation and fate of freshwater on an ice ' +
+                           'floe in the Central Arctic/'+
+                           'https://doi.org/10.5194/egusphere-2024-1977',
+                           'contributor_name': curr_contrib_name +
+                           '; Matthew Shupe; Ian Raphael',
+                           'contributor_email': curr_contrib_email +
+                           '; matthew.shupe@noaa.gov; Ian.A.Raphael.th@dartmouth.edu'})
 curr_summary = MDF_out._global_atts['summary']
 MDF_out.update_global_atts({'summary': curr_summary +
                             ', prsn is pseudo-precipitation derived from ' +
                             'accumulation at SYI stakes sites assuming snow' +
                             ' density of 330 kg/m3'})
 # Rename MDF and write files
-MDF_out._name = "MOSAiC_Raphael_snow_syi"
-MDF_out.write_files(output_dir=paths_dict['proc_data'])
+MDF_out._name = "MOSAiC_atm_drift1_stakes_snow_syi"
+MDF_out.write_files(output_dir=paths_dict['proc_data'],
+                    fname_only_underscores=True)
 
 # Repeat for SHEBA
 del MDF_out
@@ -137,4 +188,5 @@ MDF_out.update_global_atts({'summary': 'This file is a hybrid of MOSAiC '+
                             ' SHEBA stakes sites. Use with caution'})
 # Rename MDF and write files
 MDF_out._name = "MOSAiC_Raphael_snow_sheba"
-MDF_out.write_files(output_dir=paths_dict['proc_data'])
+MDF_out.write_files(output_dir=paths_dict['proc_data'],
+                    fname_only_underscores=True)
