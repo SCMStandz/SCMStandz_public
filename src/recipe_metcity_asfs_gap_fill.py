@@ -42,11 +42,14 @@ This is easiest to do on ARM's jupyterhub. See the notebook
 
 ## Parameters
 # Specify which dates belong to Drift Track 1 and Drift Track 2
-end_dt_drift_1 = pd.to_datetime("2020-07-31 12:00:00", utc=True)
-start_dt_drift_2 = pd.to_datetime("2020-08-27 12:00:00", utc=True)
+end_dt_drift_1 = pd.to_datetime("2020-07-31 12:00:00", utc=False)
+start_dt_drift_2 = pd.to_datetime("2020-08-27 12:00:00", utc=False)
 # Parameters that control bias correction and filling
 overlap_minutes = 180 # 3 hour overlap
 relaxation_minutes = 5 # so that almost all transition is in 15 min.
+# Residual gaps in radiation after filling with ASFS that are less than
+# this threshold are interpolated
+rad_interp_thrhld_minutes = 15 
 
 # Specify which variables correspond to MDF var names
 var_map_dict = {'lat'   : 'lat_tower',
@@ -209,12 +212,14 @@ def gap_fill(param, fill_source, gap_start, gap_end, offset_seconds,
         da_gap_fill += start_diff * np.exp(
             -1*minutes_forward/relaxation_minutes)
     else:
-        warnings.warn("Missing start value at")        
+        warnings.warn("Missing start value in " + param + " at " 
+                      + dt_gap_start.strftime('%Y%m%d%H%M'))        
     if not np.isnan(end_diff):
         da_gap_fill += end_diff * np.exp(
             -1*minutes_reverse/relaxation_minutes)
     else:
-        warnings.warn("Missing end value at")
+        warnings.warn("Missing end value in " + param + " at " 
+                      + dt_gap_end.strftime('%Y%m%d%H%M'))
     
     # Gap filling
     arr_src = np.full(da_gap_fill.size, fill_source, dtype='object')
@@ -252,58 +257,6 @@ def gap_fill(param, fill_source, gap_start, gap_end, offset_seconds,
                      param)
             f.savefig(os.path.join(plotpath, fname))
             plt.close(f)
-    return ds_fill
-
-def asfs_gap_fill(asfs_name, df_gap_fill, varname_dict, ds_fill,
-                  overlap_minutes, relaxation_minutes, plot=False,
-                  plotpath='.'):
-    """
-    Fill Met City gaps with specific ASFS
-
-    Parameters:
-    -----------
-    asfs_name: str
-        Name of ASFS dataset to use for gap filling
-    df_gap_fill: pandas DataFrame
-        DataFrame with which variable, station and gap to fill
-    varname_dict: dict
-        Mapping from Met City variable names to ASFS names
-    ds_fill: xarray Dataset
-        Dataset to fill gaps in.
-    overlap_minutes: numeric
-        How many minutes before and after gap to use for bias correction
-    relaxation_minutes: numeric
-        Exponential decay constant for relaxing fill values to Met City 
-        data.
-    plot: bool, optional
-        Whether or not to generate a plot for these asfs data.
-    plotpath: str, optional
-        Where to save figures to, optional.
-
-    Returns:
-    --------
-    xarray DataSet with these gaps filled
-
-    """
-
-    ds_asfs = xr.open_dataset(os.path.join(paths_dict['raw_data'], 
-        asfs_name, 'mosmet.'+asfs_name+'.level3.4.1min.mdfsubset.nc'),
-        engine='netcdf4')
-
-    # Fill gaps
-    source_dict = {'metcity': ds_metcity,
-                    asfs_name: ds_asfs
-                    }
-    # Fill identified gaps with ASFS data
-    for index, row in df_gap_fill.iterrows():
-        if row['station']==asfs_name:
-            ds_fill = gap_fill(row['param'], row['station'], 
-                               row['gap_start'], row['gap_end'], 
-                               row['offset'], ds_fill, source_dict, 
-                               overlap_minutes, relaxation_minutes, 
-                               varname_dict, primary_source='metcity', 
-                               plot=plot, plotpath=plotpath)
-    ds_asfs.close()
     return ds_fill
 
 def find_gaps(ds, param):
@@ -351,6 +304,44 @@ def find_gaps(ds, param):
     gaps_co = np.concatenate([gaps_co1, gaps_co2, gaps_co3])
 
     return gaps_co
+
+def interpolate_gap(ds_fill, param, gap_start, gap_end):
+    """
+    Convenience function for interpolating a gap in a dataset
+
+    Parameters:
+    -----------
+    ds_fill: xarray Dataset
+        The dataset to interpolate the gap in.
+    param: string
+        Name of the variable to interpolate.
+    gap_start: np.datetime64
+        Start of the gap (first missing value)
+    gap_end: np.datetime64
+        End of the gap (last missing value)
+
+    Returns:
+    --------
+    xarray Dataset with the gap interpolated.
+    """
+
+    # Get dataset for gap and time points before and after
+    ds_gap_fill = ds_fill.sel(
+        time=slice(gap_start - np.timedelta64(1, 'm'), 
+                   gap_end + np.timedelta64(1, 'm'))
+        )[[param, param+'_src']]
+    
+    # Interpolate and update _src
+    ds_gap_fill[param] = ds_gap_fill[param].interpolate_na(dim='time')
+    ds_gap_fill[param+'_src'].sel(
+        time=slice(gap_start, gap_end)).values[:] = 'interpolated'
+    
+    # Update dataset with filled values
+    ds_fill_var = ds_gap_fill.combine_first(ds_fill[[param, 
+                                                     param+'_src']])
+    ds_fill.update(ds_fill_var)
+
+    return ds_fill
 
 def calc_mix_ratio(temp, RHw, press):
     """
@@ -441,34 +432,146 @@ for i in df_gap_fill_mod.index:
             found_edge=True
             df_gap_fill_mod.at[i,'gap_end'] = edge_end
 
+# Dict to contain all data sources used for standard gap filling
+source_dict = {'metcity': ds_metcity}
+
 ## Fill gaps with ASFS data
-ds_fill = asfs_gap_fill('asfs30', df_gap_fill_mod, varname_dict, 
-                        ds_fill, overlap_minutes, relaxation_minutes)
-ds_fill = asfs_gap_fill('asfs40', df_gap_fill_mod, varname_dict, 
-                        ds_fill, overlap_minutes, relaxation_minutes)
-ds_fill = asfs_gap_fill('asfs50', df_gap_fill_mod, varname_dict, 
-                        ds_fill, overlap_minutes, relaxation_minutes)
+# Load ASFS data
+for asfs_name in ['asfs30', 'asfs40', 'asfs50']:
+    source_dict[asfs_name] = xr.open_dataset(os.path.join(
+        paths_dict['raw_data'], asfs_name, 
+        'mosmet.'+asfs_name+'.level3.4.1min.mdfsubset.nc'),
+        engine='netcdf4')
 
+# Fill identified gaps with ASFS data
+for index, row in df_gap_fill_mod.iterrows():
+    ds_fill = gap_fill(row['param'], row['station'], 
+                        row['gap_start'], row['gap_end'], 
+                        row['offset'], ds_fill, source_dict, 
+                        overlap_minutes, relaxation_minutes, 
+                        varname_dict, primary_source='metcity', 
+                        plot=False, plotpath='.')
 
-## Finish filling shortwave radiation gaps
-# First, anytime the solar zenith angle is below a critical threshold set
+## Finish filling radiation gaps
+
+# Gap filling in shortwave radiation based on C. Cox analysis
+# Using values provided by C. Cox
+rsds_ccox = pd.read_excel("rsds_ccox_analysis.xlsx", parse_dates=[0, 1])
+for index, row in rsds_ccox.iterrows():
+    dti = pd.date_range(start=row['START'], end=row['END'], freq='min')
+    if type(row['RSDS'])==float:
+        arr_dat = np.array([row['RSDS']])
+    else:
+        arr_dat = np.array(row['RSDS'].split()).astype(float)
+    arr_src = np.full(dti.size, 'cox_analysis', dtype='object')
+    ds_gap = xr.Dataset({'down_short_hemisp': ('time', arr_dat),
+                         'down_short_hemisp_src': ('time', arr_src)},
+                           coords={'time': dti})
+    ds_fill_var = ds_gap.combine_first(ds_fill[['down_short_hemisp', 
+                                                'down_short_hemisp_src']])
+    ds_fill.update(ds_fill_var)
+
+# From 2019-10-15 to 2019-10-24 05:29 Use ASFS40 with 0.64 Wm2
+# subtracted from it for times that solar zenith angle > 96 degrees
+da_gap_fill = source_dict['asfs40']['down_short_hemisp'].sel(time=
+    slice('2019-10-15 00:00:00', '2019-10-24 05:29:00')).copy(deep=True)
+da_gap_fill -= 0.64
+arr_src = np.full(da_gap_fill.size, 'asfs40', dtype='object')
+da_gap_src = xr.DataArray(arr_src, coords={'time':da_gap_fill.time},
+                            name='down_short_hemisp_src')
+ds_gap_fill = xr.merge([da_gap_fill, da_gap_src])
+ds_fill_var = ds_gap_fill.combine_first(ds_fill[['down_short_hemisp', 
+                                            'down_short_hemisp_src']])
+ds_fill.update(ds_fill_var)
+
+# Anytime the solar zenith angle is below a critical threshold set
 # downwelling shortwave to zero, for simplicity let's use the civil twilight
 # (sza > 96 degrees) applied to the solar zenith angle
 # First we have to produce a continuous record of solar zenith angle
 da_sza = ds_fill['zenith_true']
 # And interpolate to fill missing values, use linear interpolation
 da_sza = da_sza.interpolate_na(dim='time', method='linear')
-# The results are not perfect, but they look sufficient for this purpose
 crit_sza = 96
 da_sza.name = 'interp_sza'
 ds_fill = xr.merge([ds_fill, da_sza])
 ds_fill['down_short_hemisp'][(ds_fill['interp_sza'] >= crit_sza)] = 0.0
+ds_fill['down_short_hemisp_src'][(ds_fill['interp_sza'] >= crit_sza)
+                                 ] = 'sza'
 
-# Fill gaps in radiation with shiprad
-# just shortwave for now
-# Preliminary work filling missing radiation with ship data.
-# Need to revisit once ARM uploads longwave data
-# For now just use unshaded shortwave at the center detector ('spn1b_total')
+# 2020-04-14 to 2020-06-01 for residual gaps prioritize ASFS30, then
+# ASFS50, then interpolate gaps shorter than threshold, then use shiprad
+gaps_sw = find_gaps(ds_fill.sel(time=slice('2020-04-14', '2020-06-01')),
+                     'down_short_hemisp')
+for i in np.arange(gaps_sw.shape[0]):
+    # Check whether gap is complete in ASFS30
+    if not np.isnan(source_dict['asfs30']['down_short_hemisp'].sel(
+        time=slice(gaps_sw[i,0], gaps_sw[i,1])).values).any():
+        ds_fill = gap_fill('down_short_hemisp', 'asfs30', 
+            pd.to_datetime(gaps_sw[i,0]), 
+            pd.to_datetime(gaps_sw[i,1]), 
+            0, ds_fill, source_dict, overlap_minutes, 
+            relaxation_minutes, varname_dict, primary_source='metcity',
+            plot=False)
+    elif not np.isnan(source_dict['asfs50']['down_short_hemisp'].sel(
+        time=slice(gaps_sw[i,0], gaps_sw[i,1])).values).any():
+        ds_fill = gap_fill('down_short_hemisp', 'asfs50', 
+            pd.to_datetime(gaps_sw[i,0]), 
+            pd.to_datetime(gaps_sw[i,1]), 
+            0, ds_fill, source_dict, overlap_minutes, 
+            relaxation_minutes, varname_dict, primary_source='metcity',
+            plot=False)
+
+# Gap filling longwave radiation during the November storm from
+# C. Cox analysis, here are notes from Chris:
+#Two files attached on LWD for Nov 16-26 at MOSAiC.
+#*LWDfill: I made an attempt to compile an LWD for the CO based on the tower, ASFS50 and ASFS40. Let me know what you think.
+#header: yyyy mm dd HH MM lwd flag
+#lwd is the best guess
+#flag is the source: 1 = tower, 2 = asfs40, 3 = asfs50. 22 or 33 means that I time-shifted the value by some amount.
+#*AERIBT: the AERI brightness temps I mentioned.
+#header: yyyy mm dd HH MM bt h
+#bt is the brightness temp at a cloud-sensitive microwindow. It will have much larger variance than LWD, but should correlate. A good way to compare to the LWD is to convert the LWD to BT = (LWD/5.67e-8)^0.25
+df_novstorm_lwd = pd.read_csv(os.path.join(paths_dict['proc_data'], 
+                                           'novstormLWDfill.txt'),
+                             sep=",", names=['year', 'month', 'day', 
+                            'hour', 'minute', 'down_long_hemisp', 'flag'])
+df_novstorm_lwd['time'] = pd.to_datetime(df_novstorm_lwd[[
+    'year', 'month','day', 'hour', 'minute']])
+def flag_converter(flag):
+    if flag == 1:
+        return 'metcity'
+    elif flag == 2:
+        return 'asfs40'
+    elif flag == 3:
+        return 'asfs50'
+    elif flag == 22:
+        return 'asfs40'
+    elif flag == 33:
+        return 'asfs50'
+    else:
+        return ''
+df_novstorm_lwd['down_long_hemisp_src'] = df_novstorm_lwd['flag'].map(
+    flag_converter)
+ds_gap_fill = df_novstorm_lwd.set_index('time')[['down_long_hemisp', 
+                                'down_long_hemisp_src']].to_xarray()
+ds_fill_var = ds_gap_fill.combine_first(ds_fill[['down_long_hemisp', 
+                                            'down_long_hemisp_src']])
+ds_fill.update(ds_fill_var)
+
+# Find remaining gaps in downwelling radiation:
+# shortwave
+gaps_sw = find_gaps(ds_fill, 'down_short_hemisp')
+# longwave
+gaps_lw = find_gaps(ds_fill, 'down_long_hemisp')
+
+# For gaps that are longer than the interpolation threshold fill with 
+# shiprad
+# Compute gap duration
+dur_gaps_sw_min = (gaps_sw[:,1] - gaps_sw[:,0]).astype(float)/(1e9*60)
+dur_gaps_lw_min = (gaps_lw[:,1] - gaps_lw[:,0]).astype(float)/(1e9*60)
+long_gaps_sw = gaps_sw[dur_gaps_sw_min >= rad_interp_thrhld_minutes, :]
+long_gaps_lw = gaps_lw[dur_gaps_lw_min >= rad_interp_thrhld_minutes, :]
+
 ds_shipradS1 = xr.open_dataset(os.path.join(paths_dict['raw_data'], 
     'shiprad', 'mosshipradS1.b1.subset.20191015_20200918.nc'), 
     engine='netcdf4')
@@ -480,31 +583,41 @@ varname_dict_shiprad = {'lat_tower': 'lat',
                         'down_long_hemisp': 'downwelling_longwave', 
                         'down_short_hemisp': 'spn1_total_corr'}
 
-# Find gaps in shortwave
-gaps_sw = find_gaps(ds_fill, 'down_short_hemisp')
-# Find gaps in longwave
-gaps_lw = find_gaps(ds_fill, 'down_long_hemisp')
-
 df_gap_sw = pd.DataFrame({'param': 'down_short_hemisp',
-                          'gap_start': gaps_sw[:,0],
-                          'gap_end': gaps_sw[:,1],
+                          'gap_start': long_gaps_sw[:,0],
+                          'gap_end': long_gaps_sw[:,1],
                           'station': 'shipradS1',
                           'offset': 0})
 df_gap_lw = pd.DataFrame({'param': 'down_long_hemisp',
-                          'gap_start': gaps_sw[:,0],
-                          'gap_end': gaps_sw[:,1],
+                          'gap_start': long_gaps_lw[:,0],
+                          'gap_end': long_gaps_lw[:,1],
                           'station': 'shipradS1',
                           'offset': 0})
 df_gap_shiprad = pd.concat([df_gap_sw, df_gap_lw])
 
 # Fill gaps
-source_dict = {'metcity': ds_metcity,
-               'shipradS1': ds_shipradS1}
+source_dict['shipradS1'] = ds_shipradS1
 for index, row in df_gap_shiprad.iterrows():
     ds_fill = gap_fill(row['param'], row['station'], row['gap_start'], 
              row['gap_end'], row['offset'], 
              ds_fill, source_dict, overlap_minutes, relaxation_minutes,
              varname_dict_shiprad, primary_source='metcity', plot=False)
+
+# Find remaining gaps and interpolate  short enough ones
+# Find remaining gaps in downwelling radiation:
+# shortwave
+gaps_sw = find_gaps(ds_fill, 'down_short_hemisp')
+gaps_lw = find_gaps(ds_fill, 'down_long_hemisp')
+dur_gaps_sw_min = (gaps_sw[:,1] - gaps_sw[:,0]).astype(float)/(1e9*60)
+dur_gaps_lw_min = (gaps_lw[:,1] - gaps_lw[:,0]).astype(float)/(1e9*60)
+short_gaps_sw = gaps_sw[dur_gaps_sw_min < rad_interp_thrhld_minutes, :]
+short_gaps_lw = gaps_lw[dur_gaps_lw_min < rad_interp_thrhld_minutes, :]
+for i in np.arange(short_gaps_sw.shape[0]):
+    ds_fill = interpolate_gap(ds_fill, 'down_short_hemisp', 
+                              short_gaps_sw[i,0], short_gaps_sw[i,1])
+for i in np.arange(short_gaps_lw.shape[0]):
+    ds_fill = interpolate_gap(ds_fill, 'down_long_hemisp', 
+                              short_gaps_lw[i,0], short_gaps_lw[i,1])
 
 ## Create dataframe for export and compute specific humidity
 df_out = ds_fill.to_dataframe()
